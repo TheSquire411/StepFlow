@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  # Test Database
+  postgres-test:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: stepflow_test
+      POSTGRES_USER: stepflow
+      POSTGRES_PASSWORD: test_password
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stepflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Test Redis
+  redis-test:
+    image: redis:7-alpine
+    command: redis-server --requirepass test_password
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # API Service for testing
+  api-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://stepflow:test_password@postgres-test:5432/stepflow_test
+      REDIS_URL: redis://:test_password@redis-test:6379
+      JWT_SECRET: test-jwt-secret
+      AWS_ACCESS_KEY_ID: test-key
+      AWS_SECRET_ACCESS_KEY: test-secret
+      AWS_REGION: us-east-1
+      S3_BUCKET: test-bucket
+      OPENAI_API_KEY: test-openai-key
+      ELEVENLABS_API_KEY: test-elevenlabs-key
+      STRIPE_SECRET_KEY: test-stripe-key
+    ports:
+      - "3001:3000"
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+      redis-test:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Web Application for testing
+  web-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    ports:
+      - "8081:80"
+    depends_on:
+      - api-test
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3

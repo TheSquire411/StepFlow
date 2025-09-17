@@ -1,0 +1,418 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: stepflow
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: stepflow_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Lint code
+      run: |
+        npm run lint:api
+        npm run lint:web
+        npm run lint:shared
+
+    - name: Format check
+      run: npm run format:check
+
+    - name: Type check
+      run: |
+        npm run type-check:api
+        npm run type-check:web
+        npm run type-check:shared
+
+    - name: Run unit tests
+      run: npm run test:unit
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stepflow_test
+        REDIS_URL: redis://localhost:6379
+        JWT_SECRET: test-secret
+        NODE_ENV: test
+
+    - name: Run integration tests
+      run: npm run test:integration
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stepflow_test
+        REDIS_URL: redis://localhost:6379
+        JWT_SECRET: test-secret
+        NODE_ENV: test
+
+    - name: Upload test coverage
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./coverage/lcov.info
+        flags: unittests
+        name: codecov-umbrella
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Run npm audit
+      run: npm audit --audit-level moderate
+
+  build-and-push:
+    name: Build and Push Images
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    strategy:
+      matrix:
+        service: [api, web, ai-processor]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.service }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile.${{ matrix.service }}
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  e2e-tests:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Start services with Docker Compose
+      run: |
+        docker-compose -f docker-compose.test.yml up -d
+        sleep 30
+
+    - name: Run E2E tests
+      run: npm run test:e2e
+      env:
+        BASE_URL: http://localhost:3000
+
+    - name: Stop services
+      run: docker-compose -f docker-compose.test.yml down
+
+    - name: Upload E2E test artifacts
+      uses: actions/upload-artifact@v3
+      if: failure()
+      with:
+        name: e2e-screenshots
+        path: tests/e2e/screenshots/
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [e2e-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: staging
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Update kubeconfig
+      run: aws eks update-kubeconfig --name stepflow-staging --region us-east-1
+
+    - name: Deploy to staging
+      run: |
+        kubectl apply -f k8s/namespace.yaml
+        kubectl apply -f k8s/configmap.yaml
+        kubectl apply -f k8s/secrets.yaml
+        kubectl apply -f k8s/postgres.yaml
+        kubectl apply -f k8s/redis.yaml
+        kubectl apply -f k8s/api.yaml
+        kubectl apply -f k8s/web.yaml
+        kubectl apply -f k8s/ai-processor.yaml
+        kubectl apply -f k8s/ingress.yaml
+        
+        # Update image tags
+        kubectl set image deployment/api api=${{ env.REGISTRY }}/${{ github.repository }}/api:${{ github.sha }} -n stepflow
+        kubectl set image deployment/web web=${{ env.REGISTRY }}/${{ github.repository }}/web:${{ github.sha }} -n stepflow
+        kubectl set image deployment/ai-processor ai-processor=${{ env.REGISTRY }}/${{ github.repository }}/ai-processor:${{ github.sha }} -n stepflow
+        
+        # Wait for rollout
+        kubectl rollout status deployment/api -n stepflow --timeout=300s
+        kubectl rollout status deployment/web -n stepflow --timeout=300s
+        kubectl rollout status deployment/ai-processor -n stepflow --timeout=300s
+
+    - name: Run smoke tests
+      run: |
+        sleep 60
+        npm run test:smoke
+      env:
+        BASE_URL: https://staging.stepflow.com
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Update kubeconfig
+      run: aws eks update-kubeconfig --name stepflow-production --region us-east-1
+
+    - name: Pre-deployment backup
+      run: |
+        echo "Creating pre-deployment backup"
+        kubectl create job --from=cronjob/postgres-backup pre-deployment-backup-$(date +%Y%m%d-%H%M%S) -n stepflow
+        kubectl wait --for=condition=complete job/pre-deployment-backup-$(date +%Y%m%d-%H%M%S) -n stepflow --timeout=300s
+
+    - name: Deploy monitoring stack
+      run: |
+        kubectl apply -f k8s/monitoring/prometheus.yaml
+        kubectl apply -f k8s/monitoring/grafana.yaml
+        kubectl apply -f k8s/monitoring/alertmanager.yaml
+        kubectl apply -f k8s/monitoring/exporters.yaml
+
+    - name: Deploy backup infrastructure
+      run: |
+        kubectl apply -f k8s/backup/backup-cronjob.yaml
+        kubectl apply -f k8s/backup/disaster-recovery.yaml
+
+    - name: Deploy to production
+      run: |
+        kubectl apply -f k8s/namespace.yaml
+        kubectl apply -f k8s/configmap.yaml
+        kubectl apply -f k8s/secrets.yaml
+        kubectl apply -f k8s/postgres.yaml
+        kubectl apply -f k8s/redis.yaml
+        kubectl apply -f k8s/api.yaml
+        kubectl apply -f k8s/web.yaml
+        kubectl apply -f k8s/ai-processor.yaml
+        kubectl apply -f k8s/ingress.yaml
+        
+        # Update image tags with rolling update strategy
+        kubectl set image deployment/api api=${{ env.REGISTRY }}/${{ github.repository }}/api:${{ github.sha }} -n stepflow
+        kubectl set image deployment/web web=${{ env.REGISTRY }}/${{ github.repository }}/web:${{ github.sha }} -n stepflow
+        kubectl set image deployment/ai-processor ai-processor=${{ env.REGISTRY }}/${{ github.repository }}/ai-processor:${{ github.sha }} -n stepflow
+        
+        # Wait for rollout with extended timeout
+        kubectl rollout status deployment/api -n stepflow --timeout=600s
+        kubectl rollout status deployment/web -n stepflow --timeout=600s
+        kubectl rollout status deployment/ai-processor -n stepflow --timeout=600s
+
+    - name: Verify deployment health
+      run: |
+        sleep 60
+        
+        # Check pod status
+        kubectl get pods -n stepflow
+        
+        # Verify all pods are running
+        kubectl wait --for=condition=ready pod -l app=api -n stepflow --timeout=300s
+        kubectl wait --for=condition=ready pod -l app=web -n stepflow --timeout=300s
+        kubectl wait --for=condition=ready pod -l app=ai-processor -n stepflow --timeout=300s
+        
+        # Check service endpoints
+        kubectl get endpoints -n stepflow
+
+    - name: Run production smoke tests
+      run: |
+        sleep 60
+        npm run test:smoke
+      env:
+        BASE_URL: https://stepflow.com
+
+    - name: Update deployment metrics
+      run: |
+        # Record deployment metrics
+        kubectl annotate deployment api deployment.kubernetes.io/revision-history-limit=10 -n stepflow
+        kubectl annotate deployment web deployment.kubernetes.io/revision-history-limit=10 -n stepflow
+        kubectl annotate deployment ai-processor deployment.kubernetes.io/revision-history-limit=10 -n stepflow
+        
+        # Label with deployment info
+        kubectl label deployment api version=${{ github.sha }} -n stepflow --overwrite
+        kubectl label deployment web version=${{ github.sha }} -n stepflow --overwrite
+        kubectl label deployment ai-processor version=${{ github.sha }} -n stepflow --overwrite
+
+    - name: Notify deployment success
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        text: |
+          Production deployment successful! 🚀
+          Version: ${{ github.sha }}
+          Services: API, Web, AI Processor
+          Monitoring: Active
+          Backups: Configured
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      if: success()
+
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        echo "Deployment failed, initiating rollback"
+        kubectl rollout undo deployment/api -n stepflow
+        kubectl rollout undo deployment/web -n stepflow
+        kubectl rollout undo deployment/ai-processor -n stepflow
+        
+        # Wait for rollback to complete
+        kubectl rollout status deployment/api -n stepflow --timeout=300s
+        kubectl rollout status deployment/web -n stepflow --timeout=300s
+        kubectl rollout status deployment/ai-processor -n stepflow --timeout=300s
+
+    - name: Notify deployment failure
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        text: |
+          Production deployment failed! 🚨
+          Version: ${{ github.sha }}
+          Action: Automatic rollback initiated
+          Please check logs and monitoring dashboards
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      if: failure()
+
+  post-deployment:
+    name: Post-Deployment Tasks
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: success()
+
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Update kubeconfig
+      run: aws eks update-kubeconfig --name stepflow-production --region us-east-1
+
+    - name: Verify monitoring stack
+      run: |
+        kubectl get pods -n stepflow -l app=prometheus
+        kubectl get pods -n stepflow -l app=grafana
+        kubectl get pods -n stepflow -l app=alertmanager
+
+    - name: Test backup systems
+      run: |
+        # Trigger a test backup
+        kubectl create job --from=cronjob/postgres-backup test-backup-$(date +%Y%m%d-%H%M%S) -n stepflow
+
+    - name: Update documentation
+      run: |
+        echo "Deployment completed at $(date)" >> deployment-log.txt
+        echo "Version: ${{ github.sha }}" >> deployment-log.txt
+        echo "Services deployed: API, Web, AI Processor" >> deployment-log.txt

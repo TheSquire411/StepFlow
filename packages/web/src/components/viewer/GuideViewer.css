@@ -1,0 +1,131 @@
+/* Guide Viewer Styles */
+.guide-viewer {
+  @apply flex flex-col h-full bg-white;
+}
+
+.guide-viewer.fullscreen {
+  @apply fixed inset-0 z-50 bg-black;
+}
+
+.guide-viewer.fullscreen .viewer-content {
+  @apply bg-black text-white;
+}
+
+.guide-viewer.fullscreen .step-viewer {
+  @apply bg-black;
+}
+
+.guide-viewer.fullscreen .step-header h2 {
+  @apply text-white;
+}
+
+.guide-viewer.fullscreen .step-description {
+  @apply text-gray-300;
+}
+
+/* Step Viewer Styles */
+.step-viewer {
+  @apply p-6 max-w-4xl mx-auto w-full;
+}
+
+.step-screenshot {
+  @apply shadow-lg;
+  max-height: 70vh;
+}
+
+.step-screenshot img {
+  @apply max-w-full h-auto;
+}
+
+/* Annotation Renderer Styles */
+.annotation-renderer {
+  @apply pointer-events-none;
+}
+
+/* Viewer Controls Styles */
+.viewer-controls {
+  @apply sticky bottom-0 bg-white border-t border-gray-200 shadow-lg;
+}
+
+/* Viewer Progress Styles */
+.viewer-progress {
+  @apply p-4 bg-white border-b border-gray-200;
+}
+
+/* Social Sharing Styles */
+.social-sharing {
+  @apply z-30;
+}
+
+/* Mobile Responsive Styles */
+@media (max-width: 768px) {
+  .step-viewer {
+    @apply p-4;
+  }
+  
+  .step-header h2 {
+    @apply text-xl;
+  }
+  
+  .viewer-controls {
+    @apply p-3;
+  }
+  
+  .viewer-controls .flex {
+    @apply space-x-1;
+  }
+  
+  .viewer-controls button {
+    @apply p-2;
+  }
+  
+  .viewer-progress {
+    @apply p-3;
+  }
+}
+
+/* High contrast mode support */
+@media (prefers-contrast: high) {
+  .guide-viewer {
+    @apply border border-gray-900;
+  }
+  
+  .viewer-controls {
+    @apply border-t-2 border-gray-900;
+  }
+  
+  .step-screenshot {
+    @apply border border-gray-900;
+  }
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+  .guide-viewer *,
+  .step-viewer *,
+  .viewer-controls *,
+  .annotation-renderer * {
+    @apply transition-none animate-none;
+  }
+}
+
+/* Print styles */
+@media print {
+  .viewer-controls,
+  .social-sharing,
+  .viewer-progress {
+    @apply hidden;
+  }
+  
+  .guide-viewer {
+    @apply bg-white text-black;
+  }
+  
+  .step-viewer {
+    @apply p-0;
+  }
+  
+  .step-screenshot {
+    @apply shadow-none border border-gray-300;
+  }
+}

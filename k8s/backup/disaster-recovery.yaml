@@ -1,0 +1,252 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: disaster-recovery-scripts
+  namespace: stepflow
+data:
+  restore-postgres.sh: |
+    #!/bin/bash
+    set -e
+    
+    if [ -z "$1" ]; then
+      echo "Usage: $0 <backup-file-name>"
+      echo "Available backups:"
+      aws s3 ls s3://$S3_BACKUP_BUCKET/postgres-backups/ | tail -10
+      exit 1
+    fi
+    
+    BACKUP_FILE=$1
+    echo "Restoring PostgreSQL from backup: $BACKUP_FILE"
+    
+    # Download backup from S3
+    aws s3 cp s3://$S3_BACKUP_BUCKET/postgres-backups/$BACKUP_FILE /tmp/$BACKUP_FILE
+    
+    # Decompress if needed
+    if [[ $BACKUP_FILE == *.gz ]]; then
+      gunzip /tmp/$BACKUP_FILE
+      BACKUP_FILE=${BACKUP_FILE%.gz}
+    fi
+    
+    # Stop API services to prevent connections
+    kubectl scale deployment api --replicas=0 -n stepflow
+    kubectl scale deployment ai-processor --replicas=0 -n stepflow
+    
+    # Wait for pods to terminate
+    sleep 30
+    
+    # Drop and recreate database
+    PGPASSWORD=$POSTGRES_PASSWORD psql -h $POSTGRES_HOST -U $POSTGRES_USER -d postgres -c "DROP DATABASE IF EXISTS $POSTGRES_DB;"
+    PGPASSWORD=$POSTGRES_PASSWORD psql -h $POSTGRES_HOST -U $POSTGRES_USER -d postgres -c "CREATE DATABASE $POSTGRES_DB;"
+    
+    # Restore database
+    PGPASSWORD=$POSTGRES_PASSWORD psql -h $POSTGRES_HOST -U $POSTGRES_USER -d $POSTGRES_DB < /tmp/$BACKUP_FILE
+    
+    # Clean up
+    rm /tmp/$BACKUP_FILE
+    
+    # Restart API services
+    kubectl scale deployment api --replicas=3 -n stepflow
+    kubectl scale deployment ai-processor --replicas=2 -n stepflow
+    
+    echo "PostgreSQL restore completed successfully"
+
+  restore-redis.sh: |
+    #!/bin/bash
+    set -e
+    
+    if [ -z "$1" ]; then
+      echo "Usage: $0 <backup-file-name>"
+      echo "Available backups:"
+      aws s3 ls s3://$S3_BACKUP_BUCKET/redis-backups/ | tail -10
+      exit 1
+    fi
+    
+    BACKUP_FILE=$1
+    echo "Restoring Redis from backup: $BACKUP_FILE"
+    
+    # Download backup from S3
+    aws s3 cp s3://$S3_BACKUP_BUCKET/redis-backups/$BACKUP_FILE /tmp/$BACKUP_FILE
+    
+    # Decompress if needed
+    if [[ $BACKUP_FILE == *.gz ]]; then
+      gunzip /tmp/$BACKUP_FILE
+      BACKUP_FILE=${BACKUP_FILE%.gz}
+    fi
+    
+    # Stop services that use Redis
+    kubectl scale deployment api --replicas=0 -n stepflow
+    kubectl scale deployment ai-processor --replicas=0 -n stepflow
+    
+    # Wait for pods to terminate
+    sleep 30
+    
+    # Stop Redis
+    kubectl scale deployment redis --replicas=0 -n stepflow
+    sleep 10
+    
+    # Copy backup file to Redis pod volume (this is a simplified approach)
+    # In production, you'd want to use a more sophisticated method
+    kubectl scale deployment redis --replicas=1 -n stepflow
+    sleep 30
+    
+    # Get Redis pod name
+    REDIS_POD=$(kubectl get pods -n stepflow -l app=redis -o jsonpath='{.items[0].metadata.name}')
+    
+    # Copy backup to Redis pod and restore
+    kubectl cp /tmp/$BACKUP_FILE stepflow/$REDIS_POD:/data/dump.rdb
+    kubectl delete pod $REDIS_POD -n stepflow
+    
+    # Wait for Redis to restart
+    sleep 60
+    
+    # Clean up
+    rm /tmp/$BACKUP_FILE
+    
+    # Restart other services
+    kubectl scale deployment api --replicas=3 -n stepflow
+    kubectl scale deployment ai-processor --replicas=2 -n stepflow
+    
+    echo "Redis restore completed successfully"
+
+  restore-from-snapshot.sh: |
+    #!/bin/bash
+    set -e
+    
+    if [ -z "$1" ] || [ -z "$2" ]; then
+      echo "Usage: $0 <snapshot-id> <service-type>"
+      echo "Service types: postgres, redis"
+      echo "Available snapshots:"
+      aws ec2 describe-snapshots --owner-ids self --filters "Name=tag:Service,Values=stepflow" --query 'Snapshots[*].[SnapshotId,Description,StartTime]' --output table
+      exit 1
+    fi
+    
+    SNAPSHOT_ID=$1
+    SERVICE_TYPE=$2
+    
+    echo "Restoring $SERVICE_TYPE from snapshot: $SNAPSHOT_ID"
+    
+    # Create volume from snapshot
+    VOLUME_ID=$(aws ec2 create-volume --snapshot-id $SNAPSHOT_ID --availability-zone us-east-1a --query 'VolumeId' --output text)
+    echo "Created volume: $VOLUME_ID"
+    
+    # Wait for volume to be available
+    aws ec2 wait volume-available --volume-ids $VOLUME_ID
+    
+    # Tag the volume
+    aws ec2 create-tags --resources $VOLUME_ID --tags Key=Name,Value=stepflow-$SERVICE_TYPE-restore Key=Service,Value=stepflow
+    
+    echo "Volume $VOLUME_ID is ready for attachment"
+    echo "Manual steps required:"
+    echo "1. Stop the $SERVICE_TYPE deployment"
+    echo "2. Update the PersistentVolume to use volume ID: $VOLUME_ID"
+    echo "3. Restart the $SERVICE_TYPE deployment"
+    echo "4. Verify data integrity"
+
+  full-disaster-recovery.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Starting full disaster recovery procedure"
+    echo "This will restore the entire StepFlow platform from backups"
+    
+    read -p "Are you sure you want to proceed? (yes/no): " confirm
+    if [ "$confirm" != "yes" ]; then
+      echo "Disaster recovery cancelled"
+      exit 1
+    fi
+    
+    # Get latest backups
+    LATEST_POSTGRES_BACKUP=$(aws s3 ls s3://$S3_BACKUP_BUCKET/postgres-backups/ | sort | tail -1 | awk '{print $4}')
+    LATEST_REDIS_BACKUP=$(aws s3 ls s3://$S3_BACKUP_BUCKET/redis-backups/ | sort | tail -1 | awk '{print $4}')
+    
+    echo "Using backups:"
+    echo "  PostgreSQL: $LATEST_POSTGRES_BACKUP"
+    echo "  Redis: $LATEST_REDIS_BACKUP"
+    
+    # Restore PostgreSQL
+    echo "Restoring PostgreSQL..."
+    ./restore-postgres.sh $LATEST_POSTGRES_BACKUP
+    
+    # Restore Redis
+    echo "Restoring Redis..."
+    ./restore-redis.sh $LATEST_REDIS_BACKUP
+    
+    # Verify services
+    echo "Verifying services..."
+    kubectl get pods -n stepflow
+    
+    # Run health checks
+    echo "Running health checks..."
+    sleep 60
+    
+    API_HEALTH=$(kubectl exec -n stepflow deployment/api -- wget -qO- http://localhost:3000/health || echo "FAILED")
+    if [[ $API_HEALTH == *"healthy"* ]]; then
+      echo "✓ API service is healthy"
+    else
+      echo "✗ API service health check failed"
+    fi
+    
+    echo "Disaster recovery procedure completed"
+    echo "Please verify all services are functioning correctly"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: disaster-recovery-job
+  namespace: stepflow
+spec:
+  template:
+    spec:
+      containers:
+      - name: disaster-recovery
+        image: amazon/aws-cli:latest
+        command: ["/bin/bash"]
+        args: ["-c", "echo 'Disaster recovery job ready. Use kubectl exec to run recovery scripts.'"]
+        env:
+        - name: S3_BACKUP_BUCKET
+          value: "stepflow-backups"
+        - name: POSTGRES_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: stepflow-config
+              key: POSTGRES_HOST
+        - name: POSTGRES_USER
+          valueFrom:
+            configMapKeyRef:
+              name: stepflow-config
+              key: POSTGRES_USER
+        - name: POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              name: stepflow-config
+              key: POSTGRES_DB
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: stepflow-secrets
+              key: postgres-password
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: stepflow-secrets
+              key: aws-access-key-id
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: stepflow-secrets
+              key: aws-secret-access-key
+        - name: AWS_DEFAULT_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: stepflow-config
+              key: AWS_REGION
+        volumeMounts:
+        - name: recovery-scripts
+          mountPath: /scripts
+      volumes:
+      - name: recovery-scripts
+        configMap:
+          name: disaster-recovery-scripts
+          defaultMode: 0755
+      restartPolicy: Never
+  backoffLimit: 1

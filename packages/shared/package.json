@@ -1,0 +1,21 @@
+{
+  "name": "@stepflow/shared",
+  "version": "1.0.0",
+  "description": "Shared types and utilities for StepFlow platform",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest --run",
+    "test:watch": "vitest",
+    "lint": "eslint . --ext ts --report-unused-disable-directives --max-warnings 0",
+    "clean": "rm -rf dist node_modules"
+  },
+  "dependencies": {
+    "zod": "^3.21.4"
+  },
+  "devDependencies": {
+    "vitest": "^0.34.1"
+  }
+}

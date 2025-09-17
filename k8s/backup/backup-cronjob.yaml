@@ -1,0 +1,255 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: stepflow
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: postgres-backup
+            image: postgres:15-alpine
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              BACKUP_FILE="stepflow-backup-$(date +%Y%m%d-%H%M%S).sql"
+              echo "Starting backup: $BACKUP_FILE"
+              
+              # Create backup
+              pg_dump -h $POSTGRES_HOST -U $POSTGRES_USER -d $POSTGRES_DB > /tmp/$BACKUP_FILE
+              
+              # Compress backup
+              gzip /tmp/$BACKUP_FILE
+              
+              # Upload to S3
+              aws s3 cp /tmp/$BACKUP_FILE.gz s3://$S3_BACKUP_BUCKET/postgres-backups/
+              
+              # Clean up local file
+              rm /tmp/$BACKUP_FILE.gz
+              
+              # Clean up old backups (keep last 30 days)
+              aws s3 ls s3://$S3_BACKUP_BUCKET/postgres-backups/ | \
+                awk '{print $4}' | \
+                sort -r | \
+                tail -n +31 | \
+                xargs -I {} aws s3 rm s3://$S3_BACKUP_BUCKET/postgres-backups/{}
+              
+              echo "Backup completed successfully"
+            env:
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: stepflow-config
+                  key: POSTGRES_HOST
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: stepflow-config
+                  key: POSTGRES_USER
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: stepflow-config
+                  key: POSTGRES_DB
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: stepflow-secrets
+                  key: postgres-password
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: stepflow-secrets
+                  key: aws-access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: stepflow-secrets
+                  key: aws-secret-access-key
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: stepflow-config
+                  key: AWS_REGION
+            - name: S3_BACKUP_BUCKET
+              value: "stepflow-backups"
+          restartPolicy: OnFailure
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: redis-backup
+  namespace: stepflow
+spec:
+  schedule: "0 3 * * *"  # Daily at 3 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: redis-backup
+            image: redis:7-alpine
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              BACKUP_FILE="redis-backup-$(date +%Y%m%d-%H%M%S).rdb"
+              echo "Starting Redis backup: $BACKUP_FILE"
+              
+              # Create Redis backup
+              redis-cli -h $REDIS_HOST -p $REDIS_PORT -a $REDIS_PASSWORD --rdb /tmp/$BACKUP_FILE
+              
+              # Compress backup
+              gzip /tmp/$BACKUP_FILE
+              
+              # Upload to S3
+              aws s3 cp /tmp/$BACKUP_FILE.gz s3://$S3_BACKUP_BUCKET/redis-backups/
+              
+              # Clean up local file
+              rm /tmp/$BACKUP_FILE.gz
+              
+              # Clean up old backups (keep last 7 days)
+              aws s3 ls s3://$S3_BACKUP_BUCKET/redis-backups/ | \
+                awk '{print $4}' | \
+                sort -r | \
+                tail -n +8 | \
+                xargs -I {} aws s3 rm s3://$S3_BACKUP_BUCKET/redis-backups/{}
+              
+              echo "Redis backup completed successfully"
+            env:
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: stepflow-config
+                  key: REDIS_HOST
+            - name: REDIS_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: stepflow-config
+                  key: REDIS_PORT
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: stepflow-secrets
+                  key: redis-password
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: stepflow-secrets
+                  key: aws-access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: stepflow-secrets
+                  key: aws-secret-access-key
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: stepflow-config
+                  key: AWS_REGION
+            - name: S3_BACKUP_BUCKET
+              value: "stepflow-backups"
+          restartPolicy: OnFailure
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: volume-backup
+  namespace: stepflow
+spec:
+  schedule: "0 4 * * 0"  # Weekly on Sunday at 4 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: volume-backup
+            image: amazon/aws-cli:latest
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              echo "Starting volume backup"
+              
+              # Get volume IDs for persistent volumes
+              POSTGRES_VOLUME_ID=$(kubectl get pv -o jsonpath='{.items[?(@.spec.claimRef.name=="postgres-pvc")].spec.awsElasticBlockStore.volumeID}' | sed 's/aws:\/\///')
+              REDIS_VOLUME_ID=$(kubectl get pv -o jsonpath='{.items[?(@.spec.claimRef.name=="redis-pvc")].spec.awsElasticBlockStore.volumeID}' | sed 's/aws:\/\///')
+              
+              # Create snapshots
+              POSTGRES_SNAPSHOT=$(aws ec2 create-snapshot --volume-id $POSTGRES_VOLUME_ID --description "Postgres backup $(date +%Y%m%d-%H%M%S)" --query 'SnapshotId' --output text)
+              REDIS_SNAPSHOT=$(aws ec2 create-snapshot --volume-id $REDIS_VOLUME_ID --description "Redis backup $(date +%Y%m%d-%H%M%S)" --query 'SnapshotId' --output text)
+              
+              echo "Created snapshots: $POSTGRES_SNAPSHOT, $REDIS_SNAPSHOT"
+              
+              # Tag snapshots
+              aws ec2 create-tags --resources $POSTGRES_SNAPSHOT --tags Key=Name,Value=stepflow-postgres-backup Key=Service,Value=stepflow Key=Type,Value=postgres
+              aws ec2 create-tags --resources $REDIS_SNAPSHOT --tags Key=Name,Value=stepflow-redis-backup Key=Service,Value=stepflow Key=Type,Value=redis
+              
+              # Clean up old snapshots (keep last 4 weeks)
+              CUTOFF_DATE=$(date -d '28 days ago' +%Y-%m-%d)
+              
+              aws ec2 describe-snapshots --owner-ids self --filters "Name=tag:Service,Values=stepflow" --query "Snapshots[?StartTime<'$CUTOFF_DATE'].SnapshotId" --output text | \
+                xargs -n1 aws ec2 delete-snapshot --snapshot-id
+              
+              echo "Volume backup completed successfully"
+            env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: stepflow-secrets
+                  key: aws-access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: stepflow-secrets
+                  key: aws-secret-access-key
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: stepflow-config
+                  key: AWS_REGION
+          restartPolicy: OnFailure
+          serviceAccountName: backup-service-account
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 1
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backup-service-account
+  namespace: stepflow
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: stepflow
+  name: backup-role
+rules:
+- apiGroups: [""]
+  resources: ["persistentvolumes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backup-role-binding
+  namespace: stepflow
+subjects:
+- kind: ServiceAccount
+  name: backup-service-account
+  namespace: stepflow
+roleRef:
+  kind: Role
+  name: backup-role
+  apiGroup: rbac.authorization.k8s.io

@@ -1,34 +1,74 @@
 import rateLimit from 'express-rate-limit';
 import RedisStore from 'rate-limit-redis';
-import { Request, Response } from 'express';
-import { redisClient } from '../config/redis';
+import { Request, Response, NextFunction } from 'express';
+import { redisClient, isRedisAvailable } from '../config/redis';
 import { logger } from '../services/sentry.service';
 
 export interface RateLimitConfig {
   windowMs: number;
   max: number;
-  message?: string;
+  message?: string | Record<string, unknown>;
   skipSuccessfulRequests?: boolean;
   skipFailedRequests?: boolean;
   keyGenerator?: (req: Request) => string;
 }
 
+type RateLimitOptions = Parameters<typeof rateLimit>[0];
+type RateLimitHandler = ReturnType<typeof rateLimit>;
+
+const createAdaptiveRateLimiter = (options: RateLimitOptions): RateLimitHandler => {
+  const memoryLimiter = rateLimit({
+    ...options,
+    store: new rateLimit.MemoryStore(),
+  });
+
+  let redisLimiter: RateLimitHandler | null = null;
+  let warnedFallback = false;
+
+  const getRedisLimiter = (): RateLimitHandler => {
+    if (!redisLimiter) {
+      redisLimiter = rateLimit({
+        ...options,
+        store: new RedisStore({
+          sendCommand: (...args: string[]) => redisClient.call(...args),
+        }),
+      });
+    }
+    return redisLimiter;
+  };
+
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (isRedisAvailable()) {
+      warnedFallback = false;
+      return getRedisLimiter()(req, res, next);
+    }
+
+    if (!warnedFallback) {
+      logger.warn('Redis unavailable. Falling back to in-memory rate limiting.', {
+        ip: req.ip,
+        path: req.path,
+        userId: req.user?.id,
+      });
+      warnedFallback = true;
+    }
+
+    return memoryLimiter(req, res, next);
+  };
+};
+
 export class RateLimitingMiddleware {
   /**
    * General API rate limiting
    */
-  static general = rateLimit({
-    store: new RedisStore({
-      sendCommand: (...args: string[]) => redisClient.call(...args),
-    }),
+  static general = createAdaptiveRateLimiter({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 1000, // Limit each IP to 1000 requests per windowMs
     message: {
       error: {
         code: 'RATE_LIMIT_EXCEEDED',
         message: 'Too many requests from this IP, please try again later',
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     },
     standardHeaders: true,
     legacyHeaders: false,
@@ -41,26 +81,23 @@ export class RateLimitingMiddleware {
         ip: req.ip,
         userAgent: req.get('User-Agent'),
         path: req.path,
-        userId: req.user?.id
+        userId: req.user?.id,
       });
-    }
+    },
   });
 
   /**
    * Authentication endpoints rate limiting (stricter)
    */
-  static auth = rateLimit({
-    store: new RedisStore({
-      sendCommand: (...args: string[]) => redisClient.call(...args),
-    }),
+  static auth = createAdaptiveRateLimiter({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 5, // Limit each IP to 5 auth requests per windowMs
     message: {
       error: {
         code: 'AUTH_RATE_LIMIT_EXCEEDED',
         message: 'Too many authentication attempts, please try again later',
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     },
     skipSuccessfulRequests: true,
     keyGenerator: (req: Request) => `auth:${req.ip}`,
@@ -69,105 +106,93 @@ export class RateLimitingMiddleware {
         ip: req.ip,
         userAgent: req.get('User-Agent'),
         path: req.path,
-        body: { email: req.body?.email } // Log email but not password
+        body: { email: req.body?.email }, // Log email but not password
       });
-    }
+    },
   });
 
   /**
    * File upload rate limiting
    */
-  static fileUpload = rateLimit({
-    store: new RedisStore({
-      sendCommand: (...args: string[]) => redisClient.call(...args),
-    }),
+  static fileUpload = createAdaptiveRateLimiter({
     windowMs: 60 * 60 * 1000, // 1 hour
     max: 50, // Limit each user to 50 uploads per hour
     message: {
       error: {
         code: 'UPLOAD_RATE_LIMIT_EXCEEDED',
         message: 'Too many file uploads, please try again later',
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     },
     keyGenerator: (req: Request) => `upload:${req.user?.id || req.ip}`,
     onLimitReached: (req: Request) => {
       logger.warn('Upload rate limit exceeded', {
         ip: req.ip,
         userId: req.user?.id,
-        path: req.path
+        path: req.path,
       });
-    }
+    },
   });
 
   /**
    * AI processing rate limiting
    */
-  static aiProcessing = rateLimit({
-    store: new RedisStore({
-      sendCommand: (...args: string[]) => redisClient.call(...args),
-    }),
+  static aiProcessing = createAdaptiveRateLimiter({
     windowMs: 60 * 60 * 1000, // 1 hour
     max: 20, // Limit each user to 20 AI processing requests per hour
     message: {
       error: {
         code: 'AI_RATE_LIMIT_EXCEEDED',
         message: 'Too many AI processing requests, please try again later',
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     },
     keyGenerator: (req: Request) => `ai:${req.user?.id || req.ip}`,
     onLimitReached: (req: Request) => {
       logger.warn('AI processing rate limit exceeded', {
         ip: req.ip,
         userId: req.user?.id,
-        path: req.path
+        path: req.path,
       });
-    }
+    },
   });
 
   /**
    * Password reset rate limiting
    */
-  static passwordReset = rateLimit({
-    store: new RedisStore({
-      sendCommand: (...args: string[]) => redisClient.call(...args),
-    }),
+  static passwordReset = createAdaptiveRateLimiter({
     windowMs: 60 * 60 * 1000, // 1 hour
     max: 3, // Limit each IP to 3 password reset requests per hour
     message: {
       error: {
         code: 'PASSWORD_RESET_RATE_LIMIT_EXCEEDED',
         message: 'Too many password reset attempts, please try again later',
-        timestamp: new Date().toISOString()
-      }
+        timestamp: new Date().toISOString(),
+      },
     },
     keyGenerator: (req: Request) => `pwd-reset:${req.ip}`,
     onLimitReached: (req: Request) => {
       logger.warn('Password reset rate limit exceeded', {
         ip: req.ip,
         userAgent: req.get('User-Agent'),
-        email: req.body?.email
+        email: req.body?.email,
       });
-    }
+    },
   });
 
   /**
    * Create custom rate limiter
    */
   static custom(config: RateLimitConfig) {
-    return rateLimit({
-      store: new RedisStore({
-        sendCommand: (...args: string[]) => redisClient.call(...args),
-      }),
+    return createAdaptiveRateLimiter({
       windowMs: config.windowMs,
       max: config.max,
       message: config.message || {
         error: {
           code: 'RATE_LIMIT_EXCEEDED',
           message: 'Rate limit exceeded',
-          timestamp: new Date().toISOString()
-        }
+          timestamp: new Date().toISOString(),
+        },
       },
       skipSuccessfulRequests: config.skipSuccessfulRequests,
       skipFailedRequests: config.skipFailedRequests,
@@ -176,9 +201,9 @@ export class RateLimitingMiddleware {
         logger.warn('Custom rate limit exceeded', {
           ip: req.ip,
           path: req.path,
-          userId: req.user?.id
+          userId: req.user?.id,
         });
-      }
+      },
     });
   }
 }
@@ -208,15 +233,15 @@ export class DDoSProtection {
         ip,
         requestCount: ipData.count,
         userAgent: req.get('User-Agent'),
-        path: req.path
+        path: req.path,
       });
 
       return res.status(429).json({
         error: {
           code: 'IP_BANNED',
           message: 'IP temporarily banned due to suspicious activity',
-          timestamp: new Date().toISOString()
-        }
+          timestamp: new Date().toISOString(),
+        },
       });
     }
 
@@ -234,7 +259,7 @@ export class DDoSProtection {
         ip,
         requestCount: ipData.count,
         userAgent: req.get('User-Agent'),
-        path: req.path
+        path: req.path,
       });
     }
 
@@ -252,3 +277,5 @@ export class DDoSProtection {
     }
   }
 }
+
+
